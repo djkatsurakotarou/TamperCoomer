@@ -1,0 +1,611 @@
+// ==UserScript==
+// @name         Coomer Load Video Posts & Times (Text List, Concurrent, Sort, Pause & Retry Errors)
+// @namespace    http://tampermonkey.net/
+// @version      1.6.8
+// @description  Load all video posts as a centered 2-column table with video title (hyperlink) and video length. Uses invisible iframes with a configurable delay and a concurrent pool. Includes pause/resume, sort (descending by duration), print video info features, and retry functionality for error or stuck videos.
+// @match        https://coomer.su/*/user/*
+// @exclude      https://coomer.su/*/user/*/post/*
+// @grant        none
+//
+//
+// @author       DJKatsuraKotarou
+// For: Simpcity Community <3
+// For: Simpcity Community <3
+// For: Simpcity Community <3
+//
+//
+// ==/UserScript==
+
+(function() {
+  'use strict';
+
+  // -------------------- CONFIGURATION --------------------
+  const IFRAME_DELAY = 1000; // Adjusted iframe delay (in ms)
+  const CONCURRENT_BATCH_SIZE = 10; // Adjusted maximum number of video cards processed concurrently.
+  let paused = false; // Global pause flag.
+
+  // List of known video extensions (all lowercase)
+  const VIDEO_EXTENSIONS = ['m4v','avi','mpg','mp4','webm','mov','wmv','mkv','flv','3gp','3g2'];
+
+  // -------------------- CONTROL PANEL --------------------
+  const controlPanel = createControlPanel();
+  debugLog("Control panel created.");
+
+  // Button: Load Video Posts
+  const loadPostsBtn = document.createElement('button');
+  loadPostsBtn.textContent = 'Load Video Posts';
+  loadPostsBtn.style.padding = '10px';
+  loadPostsBtn.style.fontSize = '14px';
+  loadPostsBtn.style.cursor = 'pointer';
+  loadPostsBtn.addEventListener('click', async () => {
+    loadPostsBtn.disabled = true;
+    await loadAllVideos();
+    loadPostsBtn.disabled = false;
+  });
+  controlPanel.appendChild(loadPostsBtn);
+
+  // Button: Load Video Times
+  const loadTimesBtn = document.createElement('button');
+  loadTimesBtn.textContent = 'Load Video Times';
+  loadTimesBtn.style.padding = '10px';
+  loadTimesBtn.style.fontSize = '14px';
+  loadTimesBtn.style.cursor = 'pointer';
+  loadTimesBtn.style.marginLeft = '10px';
+  loadTimesBtn.addEventListener('click', async () => {
+    loadTimesBtn.disabled = true;
+    await loadVideoTimesForAll();
+    loadTimesBtn.disabled = false;
+  });
+  controlPanel.appendChild(loadTimesBtn);
+
+  // Button: Pause/Resume Loading Video Times
+  const pauseToggleBtn = document.createElement('button');
+  pauseToggleBtn.textContent = 'Pause Loading Video Times';
+  pauseToggleBtn.style.padding = '10px';
+  pauseToggleBtn.style.fontSize = '14px';
+  pauseToggleBtn.style.cursor = 'pointer';
+  pauseToggleBtn.style.marginLeft = '10px';
+  pauseToggleBtn.addEventListener('click', () => {
+    paused = !paused;
+    pauseToggleBtn.textContent = paused ? 'Resume Loading Video Times' : 'Pause Loading Video Times';
+    debugLog("Paused state set to: " + paused);
+  });
+  controlPanel.appendChild(pauseToggleBtn);
+
+  // Button: Sort Videos Descending
+  const sortVideosBtn = document.createElement('button');
+  sortVideosBtn.textContent = 'Sort Videos Descending';
+  sortVideosBtn.style.padding = '10px';
+  sortVideosBtn.style.fontSize = '14px';
+  sortVideosBtn.style.cursor = 'pointer';
+  sortVideosBtn.style.marginLeft = '10px';
+  sortVideosBtn.addEventListener('click', () => {
+    sortVideosDescending();
+  });
+  controlPanel.appendChild(sortVideosBtn);
+
+  // Button: Print Video Info Descending
+  const printVideosBtn = document.createElement('button');
+  printVideosBtn.textContent = 'Print Video Info Descending';
+  printVideosBtn.style.padding = '10px';
+  printVideosBtn.style.fontSize = '14px';
+  printVideosBtn.style.cursor = 'pointer';
+  printVideosBtn.style.marginLeft = '10px';
+  printVideosBtn.addEventListener('click', () => {
+    printVideoInfoDescending();
+  });
+  controlPanel.appendChild(printVideosBtn);
+
+  // NEW Button: Retry Error/Stuck Video Times
+  const retryBtn = document.createElement('button');
+  retryBtn.textContent = 'Retry Error/Stuck Video Times';
+  retryBtn.style.padding = '10px';
+  retryBtn.style.fontSize = '14px';
+  retryBtn.style.cursor = 'pointer';
+  retryBtn.style.marginLeft = '10px';
+  retryBtn.addEventListener('click', async () => {
+    retryBtn.disabled = true;
+    await retryErrorVideoTimes();
+    retryBtn.disabled = false;
+  });
+  controlPanel.appendChild(retryBtn);
+
+  // Create a debug output area in the control panel
+  const debugOutput = document.createElement('div');
+  debugOutput.id = 'debugOutput';
+  debugOutput.style.marginTop = '10px';
+  debugOutput.style.fontSize = '12px';
+  debugOutput.style.maxHeight = '150px';
+  debugOutput.style.overflowY = 'auto';
+  debugOutput.style.backgroundColor = '#333';
+  debugOutput.style.padding = '5px';
+  debugOutput.style.width = '100%';
+  controlPanel.appendChild(debugOutput);
+
+  // -------------------- DEBUG FUNCTION --------------------
+  function debugLog(msg) {
+    console.log(msg);
+    const debugEl = document.getElementById('debugOutput');
+    if (debugEl) {
+      const line = document.createElement('div');
+      line.textContent = msg;
+      debugEl.appendChild(line);
+    }
+  }
+
+  // -------------------- MAIN FUNCTION: Load Video Posts --------------------
+  async function loadAllVideos() {
+    updateButtonText('Loading posts...');
+    debugLog("=== loadAllVideos() called ===");
+
+    // Hide the original posts container (if present)
+    const origContainer = document.querySelector('.card-list');
+    if (origContainer) {
+      origContainer.style.display = 'none';
+      debugLog("Original posts container hidden.");
+    }
+
+    const { service, username } = parseUrl();
+    debugLog("Parsed URL: service=" + service + ", username=" + username);
+
+    const firstPageUrl = `https://coomer.su/api/v1/${service}/user/${username}?o=0`;
+    let totalPosts = 0;
+    try {
+      debugLog("Fetching first page: " + firstPageUrl);
+      const resp = await fetch(firstPageUrl);
+      const data = await resp.json();
+      totalPosts = getTotalPostsFromDOM() || data.length;
+      debugLog("Fetched first page. Total posts: " + totalPosts);
+    } catch (e) {
+      console.error('[CoomerAll] Could not fetch first page:', e);
+      updateButtonText('Error fetching posts');
+      debugLog('Error fetching first page: ' + e);
+      return;
+    }
+    if (!totalPosts) {
+      debugLog('Total post count not found; assuming default 500');
+      totalPosts = 500;
+    }
+    const PAGE_SIZE = 50;
+    const totalPages = Math.ceil(totalPosts / PAGE_SIZE);
+    debugLog("Total pages to fetch: " + totalPages);
+
+    let allPosts = [];
+    for (let page = 0; page < totalPages; page++) {
+      updateButtonText(`Fetching page ${page + 1} / ${totalPages}`);
+      const offset = page * PAGE_SIZE;
+      const apiUrl = `https://coomer.su/api/v1/${service}/user/${username}?o=${offset}`;
+      try {
+        const resp = await fetch(apiUrl);
+        const data = await resp.json();
+        allPosts = allPosts.concat(data);
+        debugLog(`Fetched page ${page + 1} with ${data.length} posts`);
+      } catch (err) {
+        console.error(`[CoomerAll] Error fetching offset=${offset}`, err);
+        debugLog(`Error fetching page ${page + 1}: ${err}`);
+      }
+    }
+    debugLog("Total posts fetched: " + allPosts.length);
+
+    const videoPosts = allPosts.filter(hasVideoAttachment);
+    debugLog("Video posts found: " + videoPosts.length);
+
+    displayAllVideoPosts(videoPosts);
+    updateButtonText(`Done! Showing ${videoPosts.length} video posts.`);
+  }
+
+  // -------------------- HELPER: Check if a post has a video --------------------
+  function hasVideoAttachment(post) {
+    const paths = [];
+    if (post.file && post.file.path) paths.push(post.file.path);
+    if (Array.isArray(post.attachments)) {
+      for (const att of post.attachments) {
+        if (att.path) paths.push(att.path);
+      }
+    }
+    return paths.some(path => {
+      const ext = path.split('.').pop().toLowerCase();
+      return VIDEO_EXTENSIONS.includes(ext);
+    });
+  }
+
+  // -------------------- NEW: Create a table row for the video post --------------------
+  function createPostCard(post, service, username) {
+    const row = document.createElement('tr');
+    row.className = 'post-card new-generated';
+    // (data-attempted and data-loaded will be set later when processing)
+
+    // First cell: video hyperlink with the title.
+    const videoCell = document.createElement('td');
+    videoCell.style.padding = '8px';
+    videoCell.style.border = '1px solid #ddd';
+    const a = document.createElement('a');
+    a.href = `/${service}/user/${username}/post/${post.id}`;
+    a.target = '_blank';
+    a.textContent = post.title || `(No title) #${post.id}`;
+    videoCell.appendChild(a);
+    row.appendChild(videoCell);
+
+    // Second cell: placeholder for video length.
+    const lengthCell = document.createElement('td');
+    lengthCell.style.padding = '8px';
+    lengthCell.style.border = '1px solid #ddd';
+    lengthCell.className = 'video-length';
+    lengthCell.textContent = 'Length: ?';
+    row.appendChild(lengthCell);
+
+    return row;
+  }
+
+  // -------------------- NEW: Display all video posts in a centered table --------------------
+  function displayAllVideoPosts(posts) {
+    // Hide original posts container if it exists.
+    const origContainer = document.querySelector('.card-list');
+    if (origContainer) {
+      origContainer.style.display = 'none';
+      debugLog("Original posts container hidden (in displayAllVideoPosts).");
+    }
+    let table = document.querySelector('.card-list__items.new-video-container');
+    if (!table) {
+      table = document.createElement('table');
+      table.className = 'card-list__items new-video-container';
+
+      // Calculate margin-top to push the table below the fixed control panel.
+      const cp = document.getElementById('coomerControlPanel');
+      let marginTop = '20px';
+      if (cp) {
+        marginTop = (cp.offsetHeight + 20) + 'px';
+      }
+
+      table.style.width = '80%';
+      table.style.marginTop = marginTop;
+      table.style.marginLeft = 'auto';
+      table.style.marginRight = 'auto';
+      table.style.borderCollapse = 'collapse';
+
+      // Optional: add a header row.
+      const thead = document.createElement('thead');
+      const headerRow = document.createElement('tr');
+      const th1 = document.createElement('th');
+      th1.textContent = 'Video';
+      th1.style.padding = '8px';
+      th1.style.border = '1px solid #ddd';
+      const th2 = document.createElement('th');
+      th2.textContent = 'Length';
+      th2.style.padding = '8px';
+      th2.style.border = '1px solid #ddd';
+      headerRow.appendChild(th1);
+      headerRow.appendChild(th2);
+      thead.appendChild(headerRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      table.appendChild(tbody);
+      // Insert the table immediately after the control panel.
+      const controlPanel = document.getElementById('coomerControlPanel');
+      if (controlPanel) {
+        controlPanel.insertAdjacentElement('afterend', table);
+      } else {
+        document.body.insertBefore(table, document.body.firstChild);
+      }
+    } else {
+      // If table exists, clear its tbody.
+      const tbody = table.querySelector('tbody');
+      if (tbody) tbody.innerHTML = '';
+    }
+    const tbody = table.querySelector('tbody') || table;
+    const { service, username } = parseUrl();
+    posts.forEach(post => {
+      const row = createPostCard(post, service, username);
+      tbody.appendChild(row);
+    });
+  }
+
+  // -------------------- HELPER: Read total posts from the DOM --------------------
+  function getTotalPostsFromDOM() {
+    const smallEls = document.querySelectorAll('#paginator-top small, #paginator-bottom small');
+    for (const el of smallEls) {
+      const txt = el.textContent;
+      const match = txt?.match(/Showing\s+\d+\s*-\s*\d+\s+of\s+(\d+)/i);
+      if (match) return parseInt(match[1], 10);
+    }
+    return 0;
+  }
+
+  // -------------------- HELPER: Parse out service and username from URL --------------------
+  function parseUrl() {
+    const parts = window.location.pathname.split('/');
+    const service = parts[1] || 'onlyfans';
+    const username = parts[3] || 'unknown';
+    return { service, username };
+  }
+
+  // -------------------- UI: Update the Load Video Posts button text --------------------
+  function updateButtonText(txt) {
+    loadPostsBtn.textContent = txt;
+  }
+
+  // -------------------- NEW FEATURE: Load video time for a single card using an iframe --------------------
+  function loadVideoTimeForCardPromise(card) {
+    return new Promise((resolve) => {
+      // If the card has already loaded successfully, skip processing.
+      if (card.dataset.attempted && card.dataset.loaded === 'success') {
+        debugLog("Card already loaded successfully; skipping.");
+        resolve();
+        return;
+      }
+
+      const anchor = card.querySelector('a');
+      if (!anchor) {
+        debugLog("No anchor found in video card.");
+        resolve();
+        return;
+      }
+      const postUrl = new URL(anchor.getAttribute('href'), window.location.origin).href;
+      debugLog("Loading post page in iframe for card: " + postUrl);
+
+      // Create the iframe and position it off-screen.
+      const iframe = document.createElement('iframe');
+      iframe.style.position = 'absolute';
+      iframe.style.width = '0';
+      iframe.style.height = '0';
+      iframe.style.border = 'none';
+      iframe.style.left = '-9999px';
+      iframe.style.top = '-9999px';
+      iframe.src = postUrl;
+      document.body.appendChild(iframe);
+
+      iframe.onload = function() {
+        setTimeout(() => {
+          try {
+            const doc = iframe.contentDocument || iframe.contentWindow.document;
+            // Look for attachment links containing known video extensions.
+            let downloadLinks = [];
+            for (const ext of VIDEO_EXTENSIONS) {
+              const links = doc.querySelectorAll(`div.post__body ul.post__attachments li.post__attachment a[href*="${ext}"]`);
+              if (links && links.length > 0) {
+                downloadLinks.push(...links);
+              }
+            }
+            // Remove duplicates by href.
+            downloadLinks = Array.from(new Set(downloadLinks.map(a => a.href)))
+              .map(href => doc.querySelector(`a[href="${href}"]`));
+            if (!downloadLinks || downloadLinks.length === 0) {
+              // Fallback: search all anchors with any video extension.
+              const allLinks = Array.from(doc.querySelectorAll('a'));
+              downloadLinks = allLinks.filter(a => VIDEO_EXTENSIONS.some(ext => a.href.toLowerCase().includes(ext)));
+            }
+            if (!downloadLinks || downloadLinks.length === 0) {
+              debugLog("No download link with valid video extension found in post page for card.");
+              throw new Error("No download link found");
+            }
+            debugLog("Found " + downloadLinks.length + " video URL(s) for card.");
+            // Process each video link (if multiple, record the maximum duration)
+            let durations = [];
+            let processedCount = 0;
+            downloadLinks.forEach((downloadLink, index) => {
+              const videoUrl = downloadLink.href;
+              debugLog("Processing video URL: " + videoUrl);
+              const tempVideo = document.createElement('video');
+              tempVideo.preload = 'metadata';
+              tempVideo.src = videoUrl;
+              tempVideo.addEventListener('loadedmetadata', function() {
+                const duration = tempVideo.duration;
+                durations.push(duration);
+                // Record the maximum duration (if multiple)
+                if (!card.dataset.duration) {
+                  card.dataset.duration = duration;
+                } else {
+                  card.dataset.duration = Math.max(parseFloat(card.dataset.duration), duration);
+                }
+                debugLog("Loaded metadata for video " + (index+1) + ". Duration: " + duration);
+                processedCount++;
+                tempVideo.remove();
+                if (processedCount === downloadLinks.length) {
+                  const formatted = durations.map(d => formatDuration(d)).join(', ');
+                  const lengthCell = card.querySelector('.video-length');
+                  if (lengthCell) {
+                    lengthCell.textContent = 'Length: ' + formatted;
+                    debugLog("Set length for card to: " + formatted);
+                  }
+                  card.dataset.attempted = 'true';
+                  card.dataset.loaded = 'success';
+                  iframe.remove();
+                  resolve();
+                }
+              });
+              tempVideo.addEventListener('error', function() {
+                debugLog("Error loading metadata for " + videoUrl);
+                processedCount++;
+                if (processedCount === downloadLinks.length) {
+                  const lengthCell = card.querySelector('.video-length');
+                  if (lengthCell) {
+                    lengthCell.textContent = 'Length: error';
+                  }
+                  card.dataset.attempted = 'true';
+                  card.dataset.loaded = 'error';
+                  tempVideo.remove();
+                  iframe.remove();
+                  resolve();
+                }
+              });
+            });
+          } catch (err) {
+            debugLog("Error processing video time for card via iframe: " + err);
+            const lengthCell = card.querySelector('.video-length');
+            if (lengthCell) {
+              lengthCell.textContent = 'Length: error';
+            }
+            card.dataset.attempted = 'true';
+            card.dataset.loaded = 'error';
+            iframe.remove();
+            resolve();
+          }
+        }, IFRAME_DELAY);
+      };
+      iframe.onerror = function() {
+        debugLog("Error loading iframe for card.");
+        iframe.remove();
+        resolve();
+      };
+    });
+  }
+
+  // -------------------- NEW FEATURE: Process video cards concurrently (pool of up to CONCURRENT_BATCH_SIZE) --------------------
+  // Now accepts an optional parameter 'ignorePaused'. When true, it will process cards even if the global pause is active.
+  function processVideoCardsConcurrently(videoCards, ignorePaused = false) {
+    return new Promise(resolve => {
+      let index = 0;
+      let active = 0;
+      async function next() {
+        if (index >= videoCards.length && active === 0) {
+          resolve();
+          return;
+        }
+        while (active < CONCURRENT_BATCH_SIZE && index < videoCards.length) {
+          if (!ignorePaused && paused) {
+            await waitWhilePaused();
+          }
+          active++;
+          const card = videoCards[index++];
+          loadVideoTimeForCardPromise(card).then(() => {
+            active--;
+            next();
+          });
+        }
+      }
+      next();
+    });
+  }
+
+  // -------------------- NEW FEATURE: Retry loading video times for error or stuck cards --------------------
+  async function retryErrorVideoTimes() {
+    debugLog("Retrying video time loading for error or stuck cards...");
+    // Find cards that did not load successfully (either marked as error or still showing '?').
+    const retryCards = Array.from(document.querySelectorAll('.post-card.new-generated'))
+      .filter(card => card.dataset.loaded !== 'success');
+    if (retryCards.length === 0) {
+      debugLog("No error or stuck cards found to retry.");
+      return;
+    }
+    // Reset the flags and update the display for each card.
+    retryCards.forEach(card => {
+      delete card.dataset.attempted;
+      delete card.dataset.loaded;
+      const lengthCell = card.querySelector('.video-length');
+      if (lengthCell) {
+        lengthCell.textContent = 'Length: retrying...';
+      }
+    });
+    // Process these cards concurrently while ignoring the paused flag.
+    await processVideoCardsConcurrently(retryCards, true);
+    debugLog("Retry loading for error/stuck cards complete.");
+  }
+
+  // -------------------- Helper: Format seconds as H:MM:SS or M:SS --------------------
+  function formatDuration(seconds) {
+    seconds = Math.floor(seconds);
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) {
+      return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    } else {
+      return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+  }
+
+  // -------------------- NEW FEATURE: Sort Videos Descending by Duration --------------------
+  function sortVideosDescending() {
+    debugLog("Sorting video posts by duration descending...");
+    let table = document.querySelector('.card-list__items.new-video-container');
+    if (!table) {
+      debugLog("No video container found.");
+      return;
+    }
+    let cards = Array.from(table.querySelectorAll('.post-card.new-generated'));
+    cards.sort((a, b) => {
+      const da = a.dataset.duration ? parseFloat(a.dataset.duration) : -1;
+      const db = b.dataset.duration ? parseFloat(b.dataset.duration) : -1;
+      return db - da;
+    });
+    // Rebuild the table body with sorted rows.
+    const tbody = table.querySelector('tbody');
+    if (tbody) {
+      tbody.innerHTML = '';
+      cards.forEach(card => tbody.appendChild(card));
+    }
+    debugLog("Sorting complete.");
+  }
+
+  // -------------------- NEW FEATURE: Print Video Info Descending --------------------
+  function printVideoInfoDescending() {
+    debugLog("Printing video info in descending order by duration:");
+    let table = document.querySelector('.card-list__items.new-video-container');
+    if (!table) {
+      debugLog("No video container found.");
+      return;
+    }
+    let cards = Array.from(table.querySelectorAll('.post-card.new-generated'));
+    cards.sort((a, b) => {
+      const da = a.dataset.duration ? parseFloat(a.dataset.duration) : -1;
+      const db = b.dataset.duration ? parseFloat(b.dataset.duration) : -1;
+      return db - da;
+    });
+    cards.forEach(card => {
+      const title = card.querySelector('a').textContent;
+      const lengthText = card.querySelector('.video-length')?.textContent || "Length: ?";
+      const duration = card.dataset.duration ? card.dataset.duration + " sec" : "unloaded";
+      debugLog(`Video: ${title} - ${lengthText} (Duration: ${duration})`);
+    });
+  }
+
+  // -------------------- UI: Create a fixed control panel --------------------
+  function createControlPanel() {
+    const panel = document.createElement('div');
+    panel.id = 'coomerControlPanel';
+    panel.style.position = 'fixed';
+    panel.style.top = '0';
+    panel.style.left = '0';
+    panel.style.width = '100%';
+    panel.style.backgroundColor = '#222';
+    panel.style.color = '#fff';
+    panel.style.zIndex = '999999';
+    panel.style.padding = '10px';
+    panel.style.display = 'flex';
+    panel.style.flexDirection = 'row';
+    panel.style.justifyContent = 'center';
+    panel.style.alignItems = 'center';
+    panel.style.fontFamily = 'Arial, sans-serif';
+    document.body.prepend(panel);
+    // Use padding so the control panel doesn't overlap page content.
+    document.body.style.paddingTop = panel.offsetHeight + 'px';
+    return panel;
+  }
+
+  // -------------------- NEW FEATURE: Load Video Times for All --------------------
+  async function loadVideoTimesForAll() {
+    debugLog("Loading video times for all video cards using a concurrent pool...");
+    const videoCards = Array.from(document.querySelectorAll('.post-card.new-generated'));
+    debugLog(`Found ${videoCards.length} video cards for processing.`);
+    if (videoCards.length === 0) {
+      debugLog("No video cards found. Make sure to load posts first.");
+      return;
+    }
+    await processVideoCardsConcurrently(videoCards);
+    debugLog("Finished loading video times for all cards.");
+  }
+
+  // Helper: Wait while paused.
+  function waitWhilePaused() {
+    return new Promise(resolve => {
+      const checkInterval = setInterval(() => {
+        if (!paused) {
+          clearInterval(checkInterval);
+          resolve();
+        }
+      }, 100);
+    });
+  }
+
+})();
